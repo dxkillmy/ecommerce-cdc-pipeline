@@ -12,6 +12,40 @@ on a schedule and posts to Discord if anything fails.
 
 Stack: Postgres 16, Debezium 2.7, Kafka 3.8, Python, dbt 1.10, Airflow 3, Docker Compose.
 
+## Scheduling with Airflow
+
+The DAG `shop_warehouse_refresh` runs every 30 minutes. It runs `dbt run`,
+then `dbt test` (11 tests), then `checks/reconcile.py`, which compares every
+order with the shop DB. Reconcile only looks at orders older than 15 minutes,
+because newer ones might still be on their way through Kafka.
+
+There's also a `source_freshness` task that fails if no new data has arrived
+for an hour. At first it was the first step of the chain, so when the consumer
+was down nothing else ran. I moved it out so it just alerts on its own.
+
+Failed tasks post a message to Discord. The dbt and reconcile tasks retry once
+first; freshness doesn't, so the alert comes right away.
+
+![Airflow run](docs/airflow.png)
+
+A scheduled run with all four tasks passing. The red runs on the left are
+from when I stopped the consumer on purpose to test the alerts.
+
+## The tables
+
+dbt builds a star schema in the `analytics` schema:
+
+| Table | One row is | Rows |
+|---|---|---|
+| `fact_sales` | one line on an order | 779,425 |
+| `dim_customer` | one customer | 5,878 |
+| `dim_product` | one product, with its latest price | 4,631 |
+| `dim_date` | one day between the first and last order | 739 |
+
+`fact_sales` stores the price at the time of the order, so changing a
+product's price later doesn't change old sales. Cancelled orders stay in the
+table with `status = 'cancelled'`.
+
 ## Running it
 
 Needs Docker Desktop (I gave it 5 GB of memory) and Python 3.11. Put
@@ -47,8 +81,9 @@ http://localhost:8081.
 
 ## Results
 
-- **Full dataset:** I replayed all 36,969 orders (779,425 order lines) in
-about 7 minutes. Reconcile matched every order.
+- **Full dataset:** I replayed all 36,969 orders (779,425 order lines) in about
+  7 minutes. Across the four Kafka topics that was about 910K change events
+  (product price updates are counted too). Reconcile matched every order.
 - **Latency:** p50 about 1 s, p95 about 1.7 s from the shop DB commit to the warehouse (500 orders, 5 orders per second).
 - **Throughput:** about 1,200 events/s with batch size 1, about 5,000 with batch size 500 (replaying ~179k events).
 - **Data checks:** 11 dbt tests, source freshness, and an order-by-order reconciliation against the shop DB. I also compared it with my batch warehouse from the previous project: 2,050 orders matched to the cent.
